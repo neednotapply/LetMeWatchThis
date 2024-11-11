@@ -1,6 +1,6 @@
 Privacy Policy for LetMeWatchThis
 
-This Privacy Policy governs the collection, use, and sharing of personal information by LetMeWatchThis, a Discord bot developed by NeedNotApply_tv. By using LetMeWatchThis, you agree to the terms of this Privacy Policy.
+This Privacy Policy governs the collection, use, and sharing of personal information by [YOURNAMEHERE], a Discord bot developed by [YOURNAMEHERE]. By using LetMeWatchThis, you agree to the terms of this Privacy Policy.
 
 Information We Collect
 
@@ -28,7 +28,7 @@ We may update this Privacy Policy from time to time, and we will post the update
 
 Contact Us
 
-If you have any questions or concerns about this Privacy Policy, please contact us @NeedNotApply_tv.
+If you have any questions or concerns about this Privacy Policy, please contact us [YOURNAMEHERE].
 
 Effective Date
 
