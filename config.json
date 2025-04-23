@@ -1,7 +1,10 @@
 {
-    "token": "_",
-	"guildId": "_",
-	"omdbApiKey": "_",
+    "token": "TOKEN",
+	"guildId": "ID",
+	"omdbApiKey": "KEY",
     "prefix": "!",
-    "ownerID": "_"
+	"plex": {
+		"url": "URL",
+		"token": "token"
+  }
 }
