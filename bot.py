@@ -3,7 +3,7 @@ import json
 import logging
 import urllib.parse
 import asyncio
-
+import uuid
 import aiohttp
 import discord
 from discord import Interaction, app_commands
@@ -33,6 +33,20 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
+
+def _plex_headers():
+    client_identifier = PLEX_CONFIG.get("clientIdentifier") or os.environ.get("PLEX_CLIENT_IDENTIFIER")
+    if not client_identifier:
+        client_identifier = str(uuid.UUID(int=uuid.getnode()))
+
+    return {
+        "X-Plex-Product": "LetMeWatchThis",
+        "X-Plex-Version": "1.0",
+        "X-Plex-Device": "DiscordBot",
+        "X-Plex-Platform": "Python",
+        "X-Plex-Client-Identifier": client_identifier,
+    }
+
 async def fetch_json(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
@@ -47,10 +61,12 @@ async def verify_plex_connection():
     status_url = f"{PLEX_URL.rstrip('/')}/status/sessions"
     params = {"X-Plex-Token": PLEX_TOKEN}
     timeout = aiohttp.ClientTimeout(total=10)
+    headers = _plex_headers()
 
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(status_url, params=params) as response:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(status_url, params=params, headers=headers) as response:
+
                 if response.status == 200:
                     logging.info("Plex connection verified at %s", status_url)
                     return True
@@ -180,17 +196,36 @@ async def watch(interaction: Interaction, title: str):
         return
 
     options = []
+    seen_values = set()
     for item in search_results["Search"]:
-        omdb_title = item["Title"]
-        media_type = item["Type"]
-        imdb_id = item["imdbID"]
+        omdb_title = item.get("Title")
+        media_type = item.get("Type")
+        imdb_id = item.get("imdbID")
+
+        if not omdb_title or not media_type or not imdb_id:
+            logging.warning("Skipping search result missing required fields: %s", item)
+            continue
+
+        normalized_media_type = media_type.lower()
+        option_value = f"{imdb_id}|{normalized_media_type}"
+
+        if option_value in seen_values:
+            logging.info("Skipping duplicate select option for %s (%s)", omdb_title, option_value)
+            continue
+
+        seen_values.add(option_value)
         options.append(discord.SelectOption(
-            label=f"{omdb_title} ({item['Year']}) [{media_type.capitalize()}]",
-            value=f"{imdb_id}|{media_type}"
+            label=f"{omdb_title} ({item.get('Year', 'N/A')}) [{normalized_media_type.capitalize()}]",
+            value=option_value
         ))
 
-    if len(options) > 20:
-        options = options[:20]
+        if len(options) >= 25:
+            logging.info("Limiting select menu to 25 options")
+            break
+
+    if not options:
+        await interaction.followup.send("No valid results found to display.")
+        return
 
     select = discord.ui.Select(placeholder="Select a movie or TV show", options=options)
 
