@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import urllib.parse
+import asyncio
 
 import aiohttp
 import discord
@@ -21,23 +22,69 @@ TOKEN = config["token"]
 GUILD_ID = int(config["guildId"])  # This is still available if needed elsewhere
 OMDB_API_KEY = config["omdbApiKey"]
 PREFIX = config["prefix"]
+PLEX_CONFIG = config.get("plex", {})
+PLEX_URL = PLEX_CONFIG.get("url")
+PLEX_TOKEN = PLEX_CONFIG.get("token")
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
 async def fetch_json(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             return await response.json()
 
+
+async def verify_plex_connection():
+    if not PLEX_URL or not PLEX_TOKEN:
+        logging.info("Skipping Plex connection test; missing URL or token in config.")
+        return False
+
+    status_url = f"{PLEX_URL.rstrip('/')}/status/sessions"
+    params = {"X-Plex-Token": PLEX_TOKEN}
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(status_url, params=params) as response:
+                if response.status == 200:
+                    logging.info("Plex connection verified at %s", status_url)
+                    return True
+
+                response_text = await response.text()
+                logging.warning(
+                    "Plex connection check returned status %s at %s: %s",
+                    response.status,
+                    status_url,
+                    response_text[:200],
+                )
+                return False
+    except Exception:
+        logging.exception("Failed to connect to Plex at %s", status_url)
+        return False
+
 async def get_streaming_links(imdb_id, title, media_type):
     """Search Fmovies using IMDb ID for movies, and fuzzy matching for TV shows."""
 
-    async def search_fmovies(query):
+    def is_valid_href(href: str, expected_media_type: str) -> bool:
+        if not href:
+            return False
+
+        movie_paths = ("/movie/", "/movies/")
+        tv_paths = ("/tv/",)
+
+        if expected_media_type == "movie":
+            return any(path in href for path in movie_paths)
+        if expected_media_type == "series" or expected_media_type == "tv":
+            return any(path in href for path in tv_paths)
+
+        return True
+
+    async def search_fmovies(query, expected_media_type):
         browser = None
         encoded_query = urllib.parse.quote_plus(query)
         search_url = f"https://en.fmovies24-to.com/search?q={encoded_query}"
@@ -68,7 +115,7 @@ async def get_streaming_links(imdb_id, title, media_type):
                     if not title_attr:
                         title_attr = link.get("title") or link.get_text(strip=True)
 
-                    if title_attr and href:
+                    if title_attr and href and is_valid_href(href, expected_media_type):
                         results.append((title_attr, href))
 
                 return results
@@ -84,12 +131,12 @@ async def get_streaming_links(imdb_id, title, media_type):
 
     # 1st Attempt: Use IMDb ID if it's a movie
     if media_type == "movie":
-        fmovies_results = await search_fmovies(imdb_id)
+        fmovies_results = await search_fmovies(imdb_id, media_type)
         if fmovies_results:
             return [f"[{title}](https://en.fmovies24-to.com{fmovies_results[0][1]})"]
 
     # 2nd Attempt: Use fuzzy matching for TV shows
-    fmovies_results = await search_fmovies(title)
+    fmovies_results = await search_fmovies(title, media_type)
     if not fmovies_results:
         return ["No streaming links found. Fmovies may be unavailable right now."]
 
@@ -113,6 +160,11 @@ async def get_streaming_links(imdb_id, title, media_type):
 async def on_ready():
     # Global sync – note that global commands may take some time to appear
     await bot.tree.sync()
+    plex_verified = await verify_plex_connection()
+    if plex_verified:
+        logging.info("Plex connection is available; Plex results should be reachable.")
+    else:
+        logging.warning("Plex connection could not be verified; Plex results may be unavailable.")
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="watch", description="Search OMDb for movies or series")
@@ -148,7 +200,6 @@ async def watch(interaction: Interaction, title: str):
             imdb_id, media_type = select_interaction.data["values"][0].split("|")
             details_url = f"http://www.omdbapi.com/?apikey={OMDB_API_KEY}&i={imdb_id}&plot=short"
             details = await fetch_json(details_url)
-            streaming_links = await get_streaming_links(imdb_id, details.get("Title", ""), media_type)
 
             embed = discord.Embed(title=details.get("Title", "Unknown title"), description=details.get("Plot", "No plot available."), color=discord.Color.blue())
             embed.set_thumbnail(url=details.get("Poster"))
@@ -156,13 +207,27 @@ async def watch(interaction: Interaction, title: str):
             embed.add_field(name="IMDb Rating", value=details.get("imdbRating", "N/A"))
             embed.add_field(name="Type", value=media_type.capitalize())
 
-            streaming_links_text = "\n".join(streaming_links)
-            if len(streaming_links_text) > 1024:
-                streaming_links_text = "Too many links, try searching manually on Fmovies."
+            embed.add_field(name="Streaming Links", value="Fetching streaming links...", inline=False)
 
-            embed.add_field(name="Streaming Links", value=streaming_links_text or "No streaming links found.", inline=False)
+            message = await select_interaction.edit_original_response(embed=embed, view=None)
 
-            await select_interaction.edit_original_response(embed=embed, view=None)
+            async def update_streaming_links_message():
+                try:
+                    streaming_links = await get_streaming_links(imdb_id, details.get("Title", ""), media_type)
+                    streaming_links_text = "\n".join(streaming_links)
+                    if len(streaming_links_text) > 1024:
+                        streaming_links_text = "Too many links, try searching manually on Fmovies."
+
+                    updated_embed = embed.copy()
+                    updated_embed.set_field_at(3, name="Streaming Links", value=streaming_links_text or "No streaming links found.", inline=False)
+                    await message.edit(embed=updated_embed)
+                except Exception:
+                    logging.exception("Error updating streaming links")
+                    fallback_embed = embed.copy()
+                    fallback_embed.set_field_at(3, name="Streaming Links", value="Sorry, something went wrong while fetching streaming links.", inline=False)
+                    await message.edit(embed=fallback_embed)
+
+            asyncio.create_task(update_streaming_links_message())
         except Exception:
             logging.exception("Error handling selection callback")
             await select_interaction.edit_original_response(content="Sorry, something went wrong while fetching streaming links.", view=None)
