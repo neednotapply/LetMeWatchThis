@@ -4,7 +4,6 @@ import logging
 import urllib.parse
 import asyncio
 import uuid
-
 import aiohttp
 import discord
 from discord import Interaction, app_commands
@@ -62,12 +61,12 @@ async def verify_plex_connection():
     status_url = f"{PLEX_URL.rstrip('/')}/status/sessions"
     params = {"X-Plex-Token": PLEX_TOKEN}
     timeout = aiohttp.ClientTimeout(total=10)
-
     headers = _plex_headers()
 
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(status_url, params=params, headers=headers) as response:
+
                 if response.status == 200:
                     logging.info("Plex connection verified at %s", status_url)
                     return True
