@@ -1,10 +1,13 @@
 import os
 import json
-import discord
-from discord.ext import commands
-from discord import app_commands, Interaction, Embed, ui
+import logging
+import urllib.parse
+
 import aiohttp
-from playwright.async_api import async_playwright
+import discord
+from discord import Interaction, app_commands
+from discord.ext import commands
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
 
@@ -24,56 +27,84 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
+logging.basicConfig(level=logging.INFO)
+
 async def fetch_json(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             return await response.json()
 
 async def get_streaming_links(imdb_id, title, media_type):
-    """Search Primewire using IMDb ID for movies, and fuzzy matching for TV shows."""
-    async def search_primewire(query):
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto("https://www.primewire.tf", timeout=60000)
-            await page.fill('input#search_term', query)
-            await page.click('button.btn[type="submit"]')
-            await page.wait_for_load_state('networkidle')
-            content = await page.content()
-            await browser.close()
+    """Search Fmovies using IMDb ID for movies, and fuzzy matching for TV shows."""
 
-            soup = BeautifulSoup(content, "html.parser")
-            primewire_results = []
-            for result in soup.select('.index_item a'):
-                href = result.get('href')
-                result_title = result.get('title') or result.text.strip()
-                if href and result_title and "genre[]" not in href:
-                    primewire_results.append((result_title, href))
-            return primewire_results
+    async def search_fmovies(query):
+        browser = None
+        encoded_query = urllib.parse.quote_plus(query)
+        search_url = f"https://en.fmovies24-to.com/search?q={encoded_query}"
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(search_url, timeout=60000)
+                await page.wait_for_selector("div.germ.p-card > div > a.poster", timeout=20000)
+
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
+
+                results = []
+                cards = soup.select("div.germ.p-card > div")
+                for card in cards:
+                    link = card.select_one("a.poster") or card.select_one("a")
+                    if not link:
+                        continue
+
+                    href = link.get("href")
+                    title_attr = None
+
+                    img = link.find("img")
+                    if img:
+                        title_attr = img.get("alt")
+
+                    if not title_attr:
+                        title_attr = link.get("title") or link.get_text(strip=True)
+
+                    if title_attr and href:
+                        results.append((title_attr, href))
+
+                return results
+        except PlaywrightTimeoutError:
+            logging.error("Fmovies search timed out while waiting for results.")
+            return []
+        except Exception:
+            logging.exception("Unexpected error while searching Fmovies")
+            return []
+        finally:
+            if browser:
+                await browser.close()
 
     # 1st Attempt: Use IMDb ID if it's a movie
     if media_type == "movie":
-        primewire_results = await search_primewire(imdb_id)
-        if primewire_results:
-            return [f"[{title}](https://www.primewire.tf{primewire_results[0][1]})"]
+        fmovies_results = await search_fmovies(imdb_id)
+        if fmovies_results:
+            return [f"[{title}](https://en.fmovies24-to.com{fmovies_results[0][1]})"]
 
     # 2nd Attempt: Use fuzzy matching for TV shows
-    primewire_results = await search_primewire(title)
-    if not primewire_results:
-        return ["No streaming links found."]
+    fmovies_results = await search_fmovies(title)
+    if not fmovies_results:
+        return ["No streaming links found. Fmovies may be unavailable right now."]
 
     match_threshold = 75
     matched_links = []
-    for result_title, href in primewire_results:
+    for result_title, href in fmovies_results:
         similarity = fuzz.token_set_ratio(title.lower(), result_title.lower())
         if similarity >= match_threshold:
-            full_link = f"https://www.primewire.tf{href}"
+            full_link = f"https://en.fmovies24-to.com{href}"
             matched_links.append(f"[{result_title}]({full_link})")
 
     if matched_links:
         links_string = "\n".join(matched_links[:3])  # Show only top 3 links
         if len(links_string) > 1024:
-            return ["Too many links, try searching manually on Primewire."]
+            return ["Too many links, try searching manually on Fmovies."]
         return [links_string]
 
     return ["No streaming links found."]
@@ -113,24 +144,28 @@ async def watch(interaction: Interaction, title: str):
 
     async def select_callback(select_interaction: Interaction):
         await select_interaction.response.defer()
-        imdb_id, media_type = select_interaction.data["values"][0].split("|")
-        details_url = f"http://www.omdbapi.com/?apikey={OMDB_API_KEY}&i={imdb_id}&plot=short"
-        details = await fetch_json(details_url)
-        streaming_links = await get_streaming_links(imdb_id, details["Title"], media_type)
+        try:
+            imdb_id, media_type = select_interaction.data["values"][0].split("|")
+            details_url = f"http://www.omdbapi.com/?apikey={OMDB_API_KEY}&i={imdb_id}&plot=short"
+            details = await fetch_json(details_url)
+            streaming_links = await get_streaming_links(imdb_id, details.get("Title", ""), media_type)
 
-        embed = discord.Embed(title=details["Title"], description=details["Plot"], color=discord.Color.blue())
-        embed.set_thumbnail(url=details.get("Poster"))
-        embed.add_field(name="Year", value=details["Year"])
-        embed.add_field(name="IMDb Rating", value=details["imdbRating"])
-        embed.add_field(name="Type", value=media_type.capitalize())
+            embed = discord.Embed(title=details.get("Title", "Unknown title"), description=details.get("Plot", "No plot available."), color=discord.Color.blue())
+            embed.set_thumbnail(url=details.get("Poster"))
+            embed.add_field(name="Year", value=details.get("Year", "N/A"))
+            embed.add_field(name="IMDb Rating", value=details.get("imdbRating", "N/A"))
+            embed.add_field(name="Type", value=media_type.capitalize())
 
-        streaming_links_text = "\n".join(streaming_links)
-        if len(streaming_links_text) > 1024:
-            streaming_links_text = "Too many links, try searching manually on Primewire."
+            streaming_links_text = "\n".join(streaming_links)
+            if len(streaming_links_text) > 1024:
+                streaming_links_text = "Too many links, try searching manually on Fmovies."
 
-        embed.add_field(name="Streaming Links", value=streaming_links_text, inline=False)
+            embed.add_field(name="Streaming Links", value=streaming_links_text or "No streaming links found.", inline=False)
 
-        await select_interaction.edit_original_response(embed=embed, view=None)
+            await select_interaction.edit_original_response(embed=embed, view=None)
+        except Exception:
+            logging.exception("Error handling selection callback")
+            await select_interaction.edit_original_response(content="Sorry, something went wrong while fetching streaming links.", view=None)
 
     select.callback = select_callback
     view = discord.ui.View()
